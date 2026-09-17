@@ -1,11 +1,32 @@
-{
+{  
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
   "customizations": {
     "vscode": {
       "extensions": [
         "Dart-Code.flutter",
         "Dart-Code.dart-code"
-      ]
+      ],
+      
+      "settings": {
+        "launch": {
+          "version": "0.2.0",
+          "configurations": [
+            {
+              "name": "Flutter Web (Auto Port 8080)",
+              "request": "launch",
+              "type": "dart",
+              "args": [
+                "-d",
+                "web-server",
+                "--web-port",
+                "8080",
+                "--web-hostname",
+                "0.0.0.0"
+              ]
+            }
+          ]
+        }
+      }
     }
   },
   "postCreateCommand": "git clone https://github.com/flutter/flutter.git -b stable /home/vscode/flutter",
@@ -14,3 +35,4 @@
   },
   "remoteUser": "vscode"
 }
+
