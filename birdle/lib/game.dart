@@ -60,6 +60,8 @@ class RussianWordApiException implements Exception {
   String toString() => message;
 }
 
+enum RussianWordValidation { noun, notFound, notNoun, numeral }
+
 const String _wiktionaryApiHost = 'ru.wiktionary.org';
 
 Future<Map<String, List<String>>> _loadRussianWordCategories(
@@ -104,6 +106,7 @@ Future<Map<String, List<String>>> _loadRussianWordCategories(
   final categoriesByWord = <String, List<String>>{};
   for (final page in pages) {
     if (page is! Map<String, dynamic> || page['title'] is! String) continue;
+    if (page.containsKey('missing')) continue;
 
     final categories = page['categories'];
     categoriesByWord[(page['title'] as String).toLowerCase()] = categories is List
@@ -135,6 +138,18 @@ bool _hasRussianNounCategory(Iterable<String> categories) {
   }
 
   return hasNoun && !hasNumeral;
+}
+
+RussianWordValidation _classifyRussianWord(
+  List<String>? categories,
+) {
+  if (categories == null) return RussianWordValidation.notFound;
+  if (categories.any((category) => category.toLowerCase().contains('числительн'))) {
+    return RussianWordValidation.numeral;
+  }
+  return _hasRussianNounCategory(categories)
+      ? RussianWordValidation.noun
+      : RussianWordValidation.notNoun;
 }
 
 /// Game state of a single round of Birdle,
@@ -235,16 +250,16 @@ class Game {
   }
 
   /// Whether [guess] is a Russian noun and is not a numeral.
-  static Future<bool> isRussianNounGuess(String guess) async {
+  static Future<RussianWordValidation> validateRussianGuess(String guess) async {
     final normalizedGuess = guess.trim().toLowerCase();
-    if (!RegExp(r'^[а-яё]{5}$').hasMatch(normalizedGuess)) return false;
+    if (!RegExp(r'^[а-яё]{5}$').hasMatch(normalizedGuess)) {
+      return RussianWordValidation.notFound;
+    }
 
     final categoriesByWord = await _loadRussianWordCategories([
       normalizedGuess,
     ]);
-    return _hasRussianNounCategory(
-      categoriesByWord[normalizedGuess] ?? const [],
-    );
+    return _classifyRussianWord(categoriesByWord[normalizedGuess]);
   }
 
   /// The maximum number of guesses allowed in this game.

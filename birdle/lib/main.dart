@@ -92,9 +92,19 @@ class _GamePageState extends State<GamePage> {
     setState(() { _isCheckingGuess = true; _guessError = null; });
 
     try {
-      final isNoun = await Game.isRussianNounGuess(guess);
+      final validation = await Game.validateRussianGuess(guess);
       if (!mounted || !identical(game, _game)) return false;
-      if (!isNoun) { setState(() { _guessError = 'Введите существительное, не числительное.'; }); return false; }
+      if (validation != RussianWordValidation.noun) {
+        setState(() {
+          _guessError = switch (validation) {
+            RussianWordValidation.notFound => 'Слово «$guess» не найдено в словаре.',
+            RussianWordValidation.numeral => '«$guess» — числительное. Введите существительное.',
+            RussianWordValidation.notNoun => '«$guess» есть в словаре, но это не существительное.',
+            RussianWordValidation.noun => null,
+          };
+        });
+        return false;
+      }
       if (game.activeIndex == -1 || game.didWin) return false;
       setState(() { game.guess(guess); });
       return true;
