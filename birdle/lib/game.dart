@@ -7,7 +7,10 @@
 library;
 
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:math';
+
+import 'package:http/http.dart' as http;
 
 /// The result of evaluating a [Letter] of a guess against the hidden word.
 enum HitType {
@@ -47,6 +50,93 @@ const List<String> legalGuesses = [
   'abort',
 ];
 
+/// A failure while fetching or parsing the Russian word list.
+class RussianWordApiException implements Exception {
+  const RussianWordApiException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+const String _wiktionaryApiHost = 'ru.wiktionary.org';
+
+Future<Map<String, List<String>>> _loadRussianWordCategories(
+  List<String> words,
+) async {
+  final response = await http
+      .get(
+        Uri.https(_wiktionaryApiHost, '/w/api.php', {
+          'action': 'query',
+          'prop': 'categories',
+          'titles': words.join('|'),
+          'cllimit': 'max',
+          'format': 'json',
+          'formatversion': '2',
+          'origin': '*',
+        }),
+        headers: const {'User-Agent': 'Birdle/0.1 (Russian word game)'},
+      )
+      .timeout(const Duration(seconds: 15));
+
+  if (response.statusCode != 200) {
+    throw RussianWordApiException(
+      'Проверка русских слов недоступна (HTTP ${response.statusCode}).',
+    );
+  }
+
+  final decoded = jsonDecode(response.body);
+  if (decoded is! Map<String, dynamic> ||
+      decoded['query'] is! Map<String, dynamic>) {
+    throw const RussianWordApiException(
+      'Не удалось прочитать ответ словаря.',
+    );
+  }
+
+  final pages = (decoded['query'] as Map<String, dynamic>)['pages'];
+  if (pages is! List) {
+    throw const RussianWordApiException(
+      'В ответе словаря отсутствует список слов.',
+    );
+  }
+
+  final categoriesByWord = <String, List<String>>{};
+  for (final page in pages) {
+    if (page is! Map<String, dynamic> || page['title'] is! String) continue;
+
+    final categories = page['categories'];
+    categoriesByWord[(page['title'] as String).toLowerCase()] = categories is List
+        ? categories
+              .whereType<Map<String, dynamic>>()
+              .map((category) => category['title'])
+              .whereType<String>()
+              .toList()
+        : const [];
+  }
+
+  return categoriesByWord;
+}
+
+bool _hasRussianNounCategory(Iterable<String> categories) {
+  var hasNoun = false;
+  var hasNumeral = false;
+
+  for (final category in categories) {
+    final title = category.replaceFirst('Категория:', '').toLowerCase();
+    if (title.contains('числительн')) {
+      hasNumeral = true;
+    }
+    if (title == 'русские существительные' ||
+        title.startsWith('существительные ') && title.endsWith('/ru') ||
+        title.startsWith('формы существительных/') && title.endsWith('/ru')) {
+      hasNoun = true;
+    }
+  }
+
+  return hasNoun && !hasNumeral;
+}
+
 /// Game state of a single round of Birdle,
 /// a five-letter word-guessing game similar to Wordle.
 ///
@@ -54,8 +144,8 @@ const List<String> legalGuesses = [
 /// evaluate guesses and track progress,
 /// but doesn't advance play on its own.
 ///
-/// Clients drive each round by calling [guess] to submit an attempt and
-/// [resetGame] to start over.
+/// Clients drive each round by calling [guess] to submit any five-letter
+/// attempt and [resetGame] to start over.
 class Game {
   /// The default maximum number of guesses allowed in a [Game].
   static const int defaultMaxGuesses = 5;
@@ -65,9 +155,97 @@ class Game {
   /// If [seed] is provided, the hidden word is
   /// chosen deterministically from [legalWords],
   /// otherwise it is selected at random.
-  Game({this.maxGuesses = defaultMaxGuesses, this.seed})
-    : _wordToGuess = _generateInitialWord(seed),
+  Game({
+    this.maxGuesses = defaultMaxGuesses,
+    this.seed,
+    String? wordToGuess,
+    List<String>? wordPool,
+  }) : _wordToGuess = wordToGuess == null
+           ? _generateInitialWord(seed)
+           : Word.fromString(wordToGuess),
+       _wordPool = wordPool,
       _guesses = List<Word>.filled(maxGuesses, Word.empty());
+
+  /// Downloads the Russian word list and creates a game with a random
+  /// five-letter Cyrillic word.
+  static Future<Game> createRussian({
+    int maxGuesses = Game.defaultMaxGuesses,
+  }) async {
+    final response = await http
+        .get(
+          Uri.parse(
+            'https://raw.githubusercontent.com/hingston/russian/master/10000-russian-words-cyrillic-only.txt',
+          ),
+        )
+        .timeout(const Duration(seconds: 15));
+
+    if (response.statusCode != 200) {
+      throw RussianWordApiException(
+        'Словарь недоступен (HTTP ${response.statusCode}).',
+      );
+    }
+
+    final russianWordPattern = RegExp(r'^[а-яё]{5}$');
+    final russianFiveLetterWords = response.body
+        .split(RegExp(r'\s+'))
+        .map((word) => word.toLowerCase())
+        .where(russianWordPattern.hasMatch)
+        .toSet()
+        .toList();
+
+    if (russianFiveLetterWords.isEmpty) {
+      throw const RussianWordApiException(
+        'В загруженном словаре нет подходящих слов.',
+      );
+    }
+
+    russianFiveLetterWords.shuffle();
+
+    String? word;
+    List<String>? russianNounWords;
+    for (var start = 0; start < russianFiveLetterWords.length; start += 50) {
+      final candidates = russianFiveLetterWords.skip(start).take(50).toList();
+      final categoriesByWord = await _loadRussianWordCategories(candidates);
+      final nouns = candidates
+          .where(
+            (candidate) => _hasRussianNounCategory(
+              categoriesByWord[candidate] ?? const [],
+            ),
+          )
+          .toList();
+
+      if (nouns.isNotEmpty) {
+        word = nouns[Random().nextInt(nouns.length)];
+        russianNounWords = nouns;
+        break;
+      }
+    }
+
+    if (word == null) {
+      throw const RussianWordApiException(
+        'В словаре не нашлось пятибуквенных существительных.',
+      );
+    }
+
+    return Game(
+      maxGuesses: maxGuesses,
+      wordToGuess: word,
+      wordPool: russianNounWords,
+    );
+  }
+
+  /// Whether [guess] is a Russian noun and is not a numeral.
+  static Future<bool> isRussianNounGuess(String guess) async {
+    final normalizedGuess = guess.trim().toLowerCase();
+    if (!RegExp(r'^[а-яё]{5}$').hasMatch(normalizedGuess)) return false;
+
+    final categoriesByWord = await _loadRussianWordCategories([
+      normalizedGuess,
+    ]);
+    return _hasRussianNounCategory(
+      categoriesByWord[normalizedGuess] ?? const [],
+    );
+  }
 
   /// The maximum number of guesses allowed in this game.
   final int maxGuesses;
@@ -78,6 +256,8 @@ class Game {
 
   /// The current hidden word, exposed publicly through [hiddenWord].
   Word _wordToGuess;
+
+  final List<String>? _wordPool;
 
   /// Backing storage for [guesses].
   ///
@@ -123,25 +303,33 @@ class Game {
 
   /// Picks a new hidden word and clears every submitted guess.
   void resetGame() {
-    _wordToGuess = _generateInitialWord(seed);
+    final wordPool = _wordPool;
+    _wordToGuess = wordPool == null
+        ? _generateInitialWord(seed)
+        : Word.fromString(
+            wordPool[Random().nextInt(wordPool.length)],
+          );
     _guesses = List<Word>.filled(maxGuesses, Word.empty());
   }
 
   /// Evaluates [guess] against the hidden word,
   /// records the result in [guesses], and returns it.
   ///
-  /// For finer control, use [isLegalGuess] to validate input or
-  /// [matchGuessOnly] to evaluate without recording the result.
+  /// Any five-letter word can be submitted; it does not have to be in
+  /// [allLegalGuesses]. Use [matchGuessOnly] to evaluate without recording it.
   Word guess(String guess) {
+    if (didWin) {
+      throw StateError('The game has already been won.');
+    }
+
     final result = matchGuessOnly(guess);
     addGuessToList(result);
     return result;
   }
 
-  /// Whether [guess] is a legal word to guess.
+  /// Whether [guess] is in the optional predefined list of guesses.
   ///
-  /// UIs can call this method before [guess] to
-  /// show players a message when they enter an invalid word.
+  /// The game accepts any five-letter word, regardless of this result.
   bool isLegalGuess(String guess) => Word.fromString(guess).isLegalGuess;
 
   /// Evaluates [guess] against the hidden word without advancing the game.
@@ -244,8 +432,6 @@ extension WordUtils on Word {
   /// but where each [Letter] has new a [HitType] of
   /// [HitType.hit], [HitType.partial], or [HitType.miss].
   Word evaluateGuess(Word hiddenWord) {
-    assert(isLegalGuess);
-
     final result = List<Letter>.filled(length, (char: '', type: HitType.none));
     // Counts hidden-word letters that can still be claimed as partial matches.
     final unmatchedHiddenLetterCounts = <String, int>{};
